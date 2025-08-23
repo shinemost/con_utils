@@ -13,6 +13,7 @@ pub struct Sender<T> {
 /// 接收者
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
+    cache: VecDeque<T>,
 }
 
 /// 发送者和接收者之间共享一个 VecDeque，用 Mutex 互斥，用 Condvar 通知
@@ -61,12 +62,22 @@ impl<T> Sender<T> {
 
 impl<T> Receiver<T> {
     pub fn recv(&mut self) -> Result<T> {
+        // 无锁 fast path
+        if let Some(v) = self.cache.pop_front() {
+            return Ok(v);
+        }
+
         // 拿到队列的锁
         let mut inner = self.shared.queue.lock().unwrap();
         loop {
             match inner.pop_front() {
                 // 读到数据返回，锁被释放
                 Some(t) => {
+                    // 如果当前队列中还有数据，那么就把消费者自身缓存的队列（空）和共享队列 swap 一下
+                    // 这样之后再读取，就可以从 self.queue 中无锁读取
+                    if !inner.is_empty() {
+                        std::mem::swap(&mut self.cache, &mut inner);
+                    }
                     return Ok(t);
                 }
                 // 读不到数据，并且生产者都退出了，释放锁并返回错误
@@ -146,7 +157,10 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         Sender {
             shared: shared.clone(),
         },
-        Receiver { shared },
+        Receiver {
+            shared,
+            cache: VecDeque::with_capacity(INITIAL_SIZE),
+        },
     )
 }
 
@@ -280,6 +294,27 @@ mod tests {
         });
 
         t1.join().unwrap();
+    }
+
+    #[test]
+    fn channel_fast_path_should_work() {
+        let (mut s, mut r) = unbounded();
+        for i in 0..10usize {
+            s.send(i).unwrap();
+        }
+
+        assert!(r.cache.is_empty());
+        // 读取一个数据，此时应该会导致 swap，cache 中有数据
+        assert_eq!(0, r.recv().unwrap());
+        // 还有 9 个数据在 cache 中
+        assert_eq!(r.cache.len(), 9);
+        // 在 queue 里没有数据了
+        assert_eq!(s.total_queued_items(), 0);
+
+        // 从 cache 里读取剩下的数据
+        for (idx, i) in r.into_iter().take(9).enumerate() {
+            assert_eq!(idx + 1, i);
+        }
     }
 
 }
