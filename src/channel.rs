@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Result};
+use std::sync::atomic::Ordering;
 use std::{
     collections::VecDeque,
     sync::{atomic::AtomicUsize, Arc, Condvar, Mutex},
 };
-use std::sync::atomic::Ordering;
 
 /// 发送者
 pub struct Sender<T> {
@@ -45,7 +45,6 @@ impl<T> Sender<T> {
         if was_empty {
             self.shared.available.notify_one();
         }
-
 
         Ok(())
     }
@@ -112,7 +111,12 @@ impl<T> Clone for Sender<T> {
 /// Drop sender
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-       self.shared.senders.fetch_sub(1, Ordering::AcqRel);
+        let old = self.shared.senders.fetch_sub(1, Ordering::AcqRel);
+        // sender 走光了，唤醒 receiver 读取数据（如果队列中还有的话），读不到就出错
+        if old <= 1 {
+            // 因为我们实现的是 MPSC，receiver 只有一个，所以 notify_all 实际等价 notify_one
+            self.shared.available.notify_all();
+        }
     }
 }
 
@@ -258,4 +262,24 @@ mod tests {
         assert!(s1.send(1).is_err());
         assert!(s2.send(1).is_err());
     }
+
+    #[test]
+    fn receiver_shall_be_notified_when_all_senders_exit() {
+        let (s, mut r) = unbounded::<usize>();
+        // 用于两个线程同步
+        let (mut sender, mut receiver) = unbounded::<usize>();
+        let t1 = thread::spawn(move || {
+            // 保证 r.recv() 先于 t2 的 drop 执行
+            sender.send(0).unwrap();
+            assert!(r.recv().is_err());
+        });
+
+        thread::spawn(move || {
+            receiver.recv().unwrap();
+            drop(s);
+        });
+
+        t1.join().unwrap();
+    }
+
 }
