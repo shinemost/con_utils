@@ -21,9 +21,24 @@ pub struct Receiver<T> {
 
 struct Shared<T> {
     queue: Mutex<VecDeque<T>>,
-    available: Condvar,
+    available: Condvar, //用于 receiver 通知
+    not_full: Condvar,  //用于 sender 通知
     senders: AtomicUsize,
     receivers: AtomicUsize,
+    capacity: usize, //通道容量
+}
+
+impl<T> Shared<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            available: Condvar::new(),
+            not_full: Condvar::new(),
+            senders: AtomicUsize::new(1),
+            receivers: AtomicUsize::new(1),
+            capacity,
+        }
+    }
 }
 
 impl<T> Sender<T> {
@@ -34,15 +49,42 @@ impl<T> Sender<T> {
             return Err(anyhow!("no receiver left"));
         }
 
-        // 加锁，访问 VecDeque，压入数据，然后立刻释放锁
-        let was_empty = {
-            let mut inner = self.shared.queue.lock().unwrap();
-            let empty = inner.is_empty();
-            inner.push_back(t);
-            empty
-        };
+        let mut inner = self.shared.queue.lock().unwrap();
+        while inner.len() >= self.shared.capacity {
+            if self.total_receivers() == 0 {
+                return Err(anyhow!("no receiver left"));
+            }
+            // 阻塞 sender
+            inner = self.shared.not_full.wait(inner).unwrap();
+        }
+
+        // 访问 VecDeque，压入数据，然后立刻释放锁
+        let was_empty = inner.is_empty();
+        inner.push_back(t);
 
         // 通知任意一个被挂起等待的消费者有数据
+        if was_empty {
+            self.shared.available.notify_one();
+        }
+
+        Ok(())
+    }
+
+    /// 尝试发送，如果队列满则立即返回错误
+    pub fn try_send(&mut self, t: T) -> Result<()> {
+        if self.total_receivers() == 0 {
+            return Err(anyhow!("no receiver left"));
+        }
+
+        let mut inner = self.shared.queue.lock().unwrap();
+
+        if inner.len() >= self.shared.capacity {
+            return Err(anyhow!("channel full"));
+        }
+
+        let was_empty = inner.is_empty();
+        inner.push_back(t);
+
         if was_empty {
             self.shared.available.notify_one();
         }
@@ -58,12 +100,20 @@ impl<T> Sender<T> {
         let queue = self.shared.queue.lock().unwrap();
         queue.len()
     }
+
+    pub fn capacity(&self) -> usize {
+        self.shared.capacity
+    }
 }
 
 impl<T> Receiver<T> {
     pub fn recv(&mut self) -> Result<T> {
         // 无锁 fast path
         if let Some(v) = self.cache.pop_front() {
+            // 如果从缓存中读取了数据，通知可能等待的发送者
+            if self.cache.is_empty() {
+                self.shared.not_full.notify_one();
+            }
             return Ok(v);
         }
 
@@ -73,6 +123,9 @@ impl<T> Receiver<T> {
             match inner.pop_front() {
                 // 读到数据返回，锁被释放
                 Some(t) => {
+                    // 通知等待的发送者有空间
+                    self.shared.not_full.notify_one();
+
                     // 如果当前队列中还有数据，那么就把消费者自身缓存的队列（空）和共享队列 swap 一下
                     // 这样之后再读取，就可以从 self.queue 中无锁读取
                     if !inner.is_empty() {
@@ -96,8 +149,36 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// 尝试接收，如果没有数据则立即返回错误
+    pub fn try_recv(&mut self) -> Result<T> {
+        if let Some(v) = self.cache.pop_front() {
+            self.shared.not_full.notify_one();
+            return Ok(v);
+        }
+
+        let mut inner = self.shared.queue.lock().unwrap();
+        if let Some(t) = inner.pop_front() {
+            self.shared.not_full.notify_one();
+            Ok(t)
+        } else if self.total_senders() == 0 {
+            Err(anyhow!("no sender left"))
+        } else {
+            Err(anyhow!("no data available"))
+        }
+    }
+
     pub fn total_senders(&self) -> usize {
         self.shared.senders.load(Ordering::SeqCst)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.shared.capacity
+    }
+
+    // 可用发送空间个数
+    pub fn available(&self) -> usize {
+        let queue = self.shared.queue.lock().unwrap();
+        self.shared.capacity - queue.len()
     }
 }
 
@@ -128,30 +209,22 @@ impl<T> Drop for Sender<T> {
             // 因为我们实现的是 MPSC，receiver 只有一个，所以 notify_all 实际等价 notify_one
             self.shared.available.notify_all();
         }
+        // 同时唤醒可能等待的发送者（因为可能有发送者在等待空间）
+        self.shared.not_full.notify_all();
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.shared.receivers.fetch_sub(1, Ordering::AcqRel);
+        // receiver 离开时，唤醒可能等待的发送者
+        self.shared.not_full.notify_all();
     }
 }
 
-const INITIAL_SIZE: usize = 32;
-impl<T> Default for Shared<T> {
-    fn default() -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::with_capacity(INITIAL_SIZE)),
-            available: Condvar::new(),
-            senders: AtomicUsize::new(1),
-            receivers: AtomicUsize::new(1),
-        }
-    }
-}
-
-/// 创建一个 unbounded channel
-pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    let shared = Shared::default();
+/// 创建一个有界通道
+pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    let shared = Shared::new(capacity);
     let shared = Arc::new(shared);
     (
         Sender {
@@ -159,10 +232,18 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         },
         Receiver {
             shared,
-            cache: VecDeque::with_capacity(INITIAL_SIZE),
+            cache: VecDeque::with_capacity(capacity),
         },
     )
 }
+
+/// 创建一个无界通道（保持原有功能）
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    bounded(100000000)
+}
+
+
+/// 创建一个 unbounded channel
 
 #[cfg(test)]
 mod tests {
@@ -317,4 +398,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_channel_should_work() {
+        let (mut s, mut r) = bounded(2);
+        s.send("hello").unwrap();
+        s.send("world").unwrap();
+
+        assert_eq!(r.recv().unwrap(), "hello");
+        assert_eq!(r.recv().unwrap(), "world");
+    }
+
+    #[test]
+    fn sender_should_block_when_full() {
+        let (mut s, mut r) = bounded(1);
+        s.send("first").unwrap();
+
+        let mut s_clone = s.clone();
+        thread::spawn(move || {
+            // 这个发送应该在主线程读取后才会完成
+            s_clone.send("second").unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(r.recv().unwrap(), "first");
+        // 现在第二个发送应该完成了
+        assert_eq!(r.recv().unwrap(), "second");
+    }
+
+    #[test]
+    fn try_send_should_work() {
+        let (mut s, mut r) = bounded(1);
+        s.send("first").unwrap();
+
+        assert!(s.try_send("second").is_err()); // 应该失败
+        assert_eq!(r.recv().unwrap(), "first");
+        assert!(s.try_send("second").is_ok()); // 现在应该成功
+    }
+
+    #[test]
+    fn try_recv_should_work() {
+        let (mut s, mut r) = bounded(1);
+        assert!(r.try_recv().is_err()); // 没有数据
+
+        s.send("data").unwrap();
+        assert_eq!(r.try_recv().unwrap(), "data");
+    }
+
+    #[test]
+    fn capacity_and_available_should_work() {
+        let (mut s, r) = bounded(5);
+        assert_eq!(s.capacity(), 5);
+        assert_eq!(r.available(), 5);
+
+        s.send(1).unwrap();
+        s.send(2).unwrap();
+        assert_eq!(r.available(), 3);
+    }
 }
